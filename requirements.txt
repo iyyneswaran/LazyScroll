@@ -1,4 +1,4 @@
-# AutoScroll — Gesture-Controlled Scrolling
+# AutoScroll — Gesture-Controlled Scrolling + Cursor + Click
 # Core dependencies
 
 opencv-python>=4.8.0
@@ -6,5 +6,8 @@ mediapipe>=0.10.9
 pynput>=1.7.6
 numpy>=1.24.0
 
-# Optional fallback for scroll control
+# Cross-platform screen resolution detection (fallback for non-Windows)
+# screeninfo>=0.8.1
+
+# Optional fallback for scroll/cursor control
 # pyautogui>=0.9.54

@@ -1,8 +1,16 @@
 """
 gesture_detector.py — Classifies hand gestures from landmark geometry.
 
-Primary gesture: "SCROLL" — index + middle fingers extended, ring + pinky folded.
-This acts as the activation gate for scrolling.
+Gesture modes:
+    "SCROLL"   — index + middle fingers extended, ring + pinky folded  → scroll control
+    "CURSOR"   — index finger only extended, others folded             → cursor control
+    "CLICK"    — pinch detected while in cursor mode (thumb↔index)     → mouse click
+    "FIST"     — all fingers folded                                    → idle
+    "OPEN_PALM" — all fingers extended                                 → idle
+
+The CLICK gesture is a *sub-state* of CURSOR: it is only detected when
+the base gesture is CURSOR and the pinch distance drops below threshold.
+This prevents accidental clicks during scrolling.
 """
 
 import math
@@ -12,6 +20,8 @@ from hand_tracker import HandResult, HandTracker
 # ---------- Gesture labels ----------
 GESTURE_NONE = "NONE"
 GESTURE_SCROLL = "SCROLL"        # index + middle up, others down
+GESTURE_CURSOR = "CURSOR"        # index up only, others down
+GESTURE_CLICK = "CLICK"          # pinch (thumb + index close) while in cursor mode
 GESTURE_FIST = "FIST"            # all fingers folded
 GESTURE_OPEN = "OPEN_PALM"       # all fingers extended
 
@@ -30,17 +40,27 @@ class GestureDetector:
     handles hand rotations and non-upright orientations.
     """
 
-    def __init__(self, extension_ratio: float = 1.15):
+    def __init__(self, extension_ratio: float = 1.15,
+                 pinch_threshold: float = 0.045):
         """
         extension_ratio: tip_dist / pip_dist must exceed this for
         a finger to be classified as extended.  Tune up for stricter
         detection, down for more lenient.
+
+        pinch_threshold: normalised 3D distance between thumb tip and
+        index tip below which a pinch is detected.
         """
         self.extension_ratio = extension_ratio
+        self.pinch_threshold = pinch_threshold
+
         # Debounce: require N consecutive identical classifications
         self._history: list[str] = []
         self._debounce_frames: int = 3
         self._current_gesture: str = GESTURE_NONE
+
+        # Exposed landmark data for downstream modules
+        self._pinch_distance: float = 1.0
+        self._finger_states: list[bool] = [False] * 5  # [thumb, index, middle, ring, pinky]
 
     @staticmethod
     def _dist(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
@@ -81,7 +101,13 @@ class GestureDetector:
     def classify(self, hand: HandResult) -> str:
         """
         Classify gesture from a single hand result.
-        Returns one of GESTURE_NONE, GESTURE_SCROLL, GESTURE_FIST, GESTURE_OPEN.
+        Returns one of GESTURE_NONE, GESTURE_SCROLL, GESTURE_CURSOR,
+        GESTURE_FIST, GESTURE_OPEN.
+
+        Note: GESTURE_CLICK is NOT returned here — pinch detection is
+        handled separately by ClickDetector to allow hysteresis and
+        cooldown logic.  Use `pinch_distance` property to feed
+        the ClickDetector.
         """
         lms = hand.landmarks
 
@@ -95,12 +121,20 @@ class GestureDetector:
         pinky_ext = self._is_finger_extended(lms, HandTracker.PINKY_TIP,
                                              HandTracker.PINKY_PIP, HandTracker.PINKY_MCP)
 
-        fingers = [thumb_ext, index_ext, middle_ext, ring_ext, pinky_ext]
-        num_extended = sum(fingers)
+        self._finger_states = [thumb_ext, index_ext, middle_ext, ring_ext, pinky_ext]
+        num_extended = sum(self._finger_states)
+
+        # Compute pinch distance (always, for ClickDetector)
+        self._pinch_distance = self._dist(
+            lms[HandTracker.THUMB_TIP], lms[HandTracker.INDEX_TIP]
+        )
 
         # --- Scroll gesture: index + middle extended, ring + pinky folded ---
         if index_ext and middle_ext and not ring_ext and not pinky_ext:
             raw = GESTURE_SCROLL
+        # --- Cursor gesture: index only extended, others folded ---
+        elif index_ext and not middle_ext and not ring_ext and not pinky_ext:
+            raw = GESTURE_CURSOR
         elif num_extended == 0:
             raw = GESTURE_FIST
         elif num_extended >= 4:
@@ -122,3 +156,17 @@ class GestureDetector:
     @property
     def is_scroll_active(self) -> bool:
         return self._current_gesture == GESTURE_SCROLL
+
+    @property
+    def is_cursor_active(self) -> bool:
+        return self._current_gesture == GESTURE_CURSOR
+
+    @property
+    def pinch_distance(self) -> float:
+        """Normalised 3D distance between thumb tip and index tip."""
+        return self._pinch_distance
+
+    @property
+    def finger_states(self) -> list[bool]:
+        """[thumb, index, middle, ring, pinky] extension states."""
+        return self._finger_states
