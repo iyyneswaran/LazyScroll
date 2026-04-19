@@ -1,5 +1,5 @@
 """
-main.py — Entry point for gesture-controlled scrolling.
+main.py — Entry point for gesture-controlled scrolling + cursor + click.
 
 Usage:
     python main.py                  # Run with defaults
@@ -7,12 +7,19 @@ Usage:
     python main.py --invert         # Use natural (inverted) scrolling
     python main.py --camera 1       # Use camera index 1
     python main.py --no-overlay     # Disable debug overlay
+    python main.py --no-cursor      # Disable cursor control (scroll only)
 
 Controls (keyboard):
     q / ESC     Quit
     c           Toggle calibration mode
     d           Toggle debug overlay
     +/-         Adjust sensitivity in real-time
+
+Gesture Modes:
+    ☝️  Index finger only    → Cursor control (move mouse)
+    ✌️  Index + middle       → Scroll mode (existing behavior)
+    🤏  Pinch (thumb+index)  → Click (single / double)
+    ✋  Open palm / fist     → Idle
 """
 
 import argparse
@@ -23,9 +30,14 @@ import numpy as np
 
 from video_capture import VideoCapture
 from hand_tracker import HandTracker, HandResult
-from gesture_detector import GestureDetector, GESTURE_SCROLL
+from gesture_detector import (
+    GestureDetector, GESTURE_SCROLL, GESTURE_CURSOR,
+    GESTURE_CLICK, GESTURE_NONE, GESTURE_FIST, GESTURE_OPEN
+)
 from motion_analyzer import MotionAnalyzer
 from scroll_controller import ScrollController
+from cursor_controller import CursorController
+from click_detector import ClickDetector
 from utils import FPSCounter, CalibrationStore
 
 
@@ -42,6 +54,19 @@ class DebugOverlay:
     ACCENT = (255, 180, 0)
     VELOCITY_POS = (0, 120, 255)    # orange for scroll-down
     VELOCITY_NEG = (255, 120, 0)    # blue for scroll-up
+    CURSOR_COLOR = (255, 200, 50)   # cyan-yellow for cursor mode
+    CLICK_COLOR = (0, 0, 255)       # red for click event
+    PINCH_READY = (0, 255, 255)     # yellow for pinch-ready
+
+    # Gesture → display color
+    MODE_COLORS = {
+        GESTURE_CURSOR: (255, 200, 50),   # gold
+        GESTURE_SCROLL: (0, 255, 120),    # green
+        GESTURE_CLICK:  (0, 0, 255),      # red
+        GESTURE_NONE:   (80, 80, 200),    # grey-blue
+        GESTURE_FIST:   (80, 80, 200),
+        GESTURE_OPEN:   (80, 80, 200),
+    }
 
     def __init__(self, frame_w: int, frame_h: int):
         self.fw = frame_w
@@ -49,55 +74,95 @@ class DebugOverlay:
 
     def draw(self, frame: np.ndarray, fps: float, gesture: str,
              finger_y: float, velocity: float, calibrating: bool,
-             hand: HandResult | None, calibration: CalibrationStore):
+             hand: HandResult | None, calibration: CalibrationStore,
+             cursor_ctrl: CursorController | None = None,
+             click_det: ClickDetector | None = None,
+             click_event: str = ""):
         """Overlay all debug info onto frame (mutates in place)."""
         h, w = frame.shape[:2]
+        mode_color = self.MODE_COLORS.get(gesture, self.INACTIVE)
 
         # --- Semi-transparent panel on the left ---
+        panel_h = 310 if cursor_ctrl else 220
         overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (260, 220), self.BG, -1)
+        cv2.rectangle(overlay, (0, 0), (280, panel_h), self.BG, -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
 
         y0 = 28
-        dy = 28
+        dy = 26
 
         # FPS
         fps_color = self.ACTIVE if fps >= 25 else self.INACTIVE
         cv2.putText(frame, f"FPS: {fps:.1f}", (10, y0),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, fps_color, 2)
 
-        # Gesture state
+        # Gesture / Mode state
         y0 += dy
-        gest_color = self.ACTIVE if gesture == GESTURE_SCROLL else self.INACTIVE
-        cv2.putText(frame, f"Gesture: {gesture}", (10, y0),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, gest_color, 2)
+        cv2.putText(frame, f"Mode: {gesture}", (10, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, mode_color, 2)
 
-        # Finger Y
-        y0 += dy
-        cv2.putText(frame, f"Finger Y: {finger_y:.4f}", (10, y0),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, self.TEXT, 1)
+        # Mode indicator dot
+        cv2.circle(frame, (265, y0 - 8), 8, mode_color, -1)
 
-        # Scroll velocity bar
-        y0 += dy
-        vel_color = self.VELOCITY_POS if velocity > 0 else self.VELOCITY_NEG
-        vel_text = f"Velocity: {velocity:+.2f}"
-        cv2.putText(frame, vel_text, (10, y0),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, vel_color, 2)
+        if gesture == GESTURE_SCROLL:
+            # ── Scroll-specific info ──
+            y0 += dy
+            cv2.putText(frame, f"Finger Y: {finger_y:.4f}", (10, y0),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, self.TEXT, 1)
 
-        # Velocity bar visualisation
-        y0 += 8
-        bar_center_x = 130
-        bar_len = int(np.clip(velocity * 15, -100, 100))
-        cv2.rectangle(frame, (bar_center_x, y0), (bar_center_x + bar_len, y0 + 10),
-                      vel_color, -1)
-        cv2.line(frame, (bar_center_x, y0 - 2), (bar_center_x, y0 + 12),
-                 self.TEXT, 1)
+            y0 += dy
+            vel_color = self.VELOCITY_POS if velocity > 0 else self.VELOCITY_NEG
+            cv2.putText(frame, f"Velocity: {velocity:+.2f}", (10, y0),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, vel_color, 2)
+
+            # Velocity bar
+            y0 += 8
+            bar_cx = 140
+            bar_len = int(np.clip(velocity * 15, -100, 100))
+            cv2.rectangle(frame, (bar_cx, y0), (bar_cx + bar_len, y0 + 10),
+                          vel_color, -1)
+            cv2.line(frame, (bar_cx, y0 - 2), (bar_cx, y0 + 12), self.TEXT, 1)
+            y0 += 18
+
+        elif gesture == GESTURE_CURSOR and cursor_ctrl:
+            # ── Cursor-specific info ──
+            y0 += dy
+            cv2.putText(frame,
+                        f"Cursor: ({cursor_ctrl.screen_x:.0f}, {cursor_ctrl.screen_y:.0f})",
+                        (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+                        self.CURSOR_COLOR, 1)
+
+            y0 += dy
+            cv2.putText(frame,
+                        f"Screen: {cursor_ctrl.screen_w}x{cursor_ctrl.screen_h}",
+                        (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.TEXT, 1)
+
+            if click_det:
+                y0 += dy
+                pinch_color = self.PINCH_READY if click_det.pinch_distance < 0.08 else self.TEXT
+                cv2.putText(frame,
+                            f"Pinch: {click_det.pinch_distance:.3f}  [{click_det.state}]",
+                            (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                            pinch_color, 1)
+
+                # Pinch distance bar
+                y0 += 8
+                bar_w = int(np.clip((1.0 - click_det.pinch_distance) * 200, 0, 200))
+                bar_color = self.CLICK_COLOR if click_det.pinch_distance < 0.045 else self.PINCH_READY
+                cv2.rectangle(frame, (10, y0), (10 + bar_w, y0 + 8), bar_color, -1)
+                cv2.rectangle(frame, (10, y0), (210, y0 + 8), self.TEXT, 1)
+                y0 += 16
+
+                if click_event:
+                    y0 += dy
+                    cv2.putText(frame, f">> {click_event} <<", (10, y0),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, self.CLICK_COLOR, 2)
 
         # Sensitivity / calibration
-        y0 += 30
+        y0 += dy
         sens_text = f"Sens: {calibration.sensitivity:.2f}  DZ: {calibration.dead_zone:.4f}"
         cv2.putText(frame, sens_text, (10, y0),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.ACCENT, 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, self.ACCENT, 1)
 
         if calibrating:
             y0 += dy
@@ -108,27 +173,65 @@ class DebugOverlay:
         if hand is not None:
             idx_tip = hand.landmarks[HandTracker.INDEX_TIP]
             cx, cy = int(idx_tip[0] * w), int(idx_tip[1] * h)
-            color = self.ACTIVE if gesture == GESTURE_SCROLL else self.INACTIVE
-            cv2.circle(frame, (cx, cy), 14, color, 2)
-            cv2.circle(frame, (cx, cy), 4, color, -1)
 
-            # Draw line between index and middle tip when scroll gesture active
-            if gesture == GESTURE_SCROLL:
+            if gesture == GESTURE_CURSOR:
+                # Cursor mode: large crosshair + circle
+                color = self.CURSOR_COLOR
+
+                # Check if click-ready (pinch close)
+                if click_det and click_det.pinch_distance < 0.08:
+                    color = self.PINCH_READY
+                if click_event:
+                    color = self.CLICK_COLOR
+
+                # Crosshair
+                cv2.line(frame, (cx - 20, cy), (cx + 20, cy), color, 2)
+                cv2.line(frame, (cx, cy - 20), (cx, cy + 20), color, 2)
+                cv2.circle(frame, (cx, cy), 18, color, 2)
+                cv2.circle(frame, (cx, cy), 4, color, -1)
+
+                # Draw thumb tip indicator when pinching
+                if click_det and click_det.pinch_distance < 0.08:
+                    thumb_tip = hand.landmarks[HandTracker.THUMB_TIP]
+                    tx, ty = int(thumb_tip[0] * w), int(thumb_tip[1] * h)
+                    cv2.line(frame, (cx, cy), (tx, ty), self.PINCH_READY, 2)
+                    cv2.circle(frame, (tx, ty), 8, self.PINCH_READY, 2)
+
+            elif gesture == GESTURE_SCROLL:
+                # Scroll mode: existing visualization
+                color = self.ACTIVE
+                cv2.circle(frame, (cx, cy), 14, color, 2)
+                cv2.circle(frame, (cx, cy), 4, color, -1)
+
                 mid_tip = hand.landmarks[HandTracker.MIDDLE_TIP]
                 mx, my = int(mid_tip[0] * w), int(mid_tip[1] * h)
                 cv2.line(frame, (cx, cy), (mx, my), self.ACTIVE, 2)
                 cv2.circle(frame, (mx, my), 10, self.ACTIVE, 2)
 
-        # --- Status bar at bottom ---
-        cv2.rectangle(frame, (0, h - 30), (w, h), self.BG, -1)
-        status = "SCROLL ACTIVE" if gesture == GESTURE_SCROLL else "Waiting for gesture (index + middle up)"
-        st_color = self.ACTIVE if gesture == GESTURE_SCROLL else self.TEXT
-        cv2.putText(frame, status, (10, h - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, st_color, 1)
+            else:
+                # Other gestures: dim marker
+                cv2.circle(frame, (cx, cy), 10, self.INACTIVE, 1)
+                cv2.circle(frame, (cx, cy), 3, self.INACTIVE, -1)
 
-        backend_text = f"[q] Quit  [c] Calibrate  [d] Overlay  [+/-] Sensitivity"
-        cv2.putText(frame, backend_text, (w - 420, h - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (140, 140, 140), 1)
+        # --- Status bar at bottom ---
+        cv2.rectangle(frame, (0, h - 34), (w, h), self.BG, -1)
+
+        if gesture == GESTURE_CURSOR:
+            status = "CURSOR ACTIVE"
+            if click_event:
+                status = f"CURSOR — {click_event}!"
+        elif gesture == GESTURE_SCROLL:
+            status = "SCROLL ACTIVE"
+        else:
+            status = "Waiting for gesture (index=cursor, index+middle=scroll)"
+
+        st_color = mode_color
+        cv2.putText(frame, status, (10, h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, st_color, 1)
+
+        keys_text = "[q] Quit  [c] Calibrate  [d] Overlay  [+/-] Sensitivity"
+        cv2.putText(frame, keys_text, (w - 430, h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 140, 140), 1)
 
 
 # ────────────────────────── Calibration phase ──────────────────────────
@@ -191,7 +294,7 @@ def run_calibration(cap: VideoCapture, tracker: HandTracker,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Gesture-controlled OS-level scrolling via webcam"
+        description="Gesture-controlled OS-level scrolling + cursor + click via webcam"
     )
     parser.add_argument("--camera", type=int, default=0, help="Camera index")
     parser.add_argument("--width", type=int, default=640, help="Capture width")
@@ -199,6 +302,7 @@ def main():
     parser.add_argument("--calibrate", action="store_true", help="Run calibration first")
     parser.add_argument("--invert", action="store_true", help="Invert scroll direction")
     parser.add_argument("--no-overlay", action="store_true", help="Disable debug overlay")
+    parser.add_argument("--no-cursor", action="store_true", help="Disable cursor control")
     parser.add_argument("--sensitivity", type=float, default=1.0, help="Scroll sensitivity multiplier")
     args = parser.parse_args()
 
@@ -219,13 +323,37 @@ def main():
     fps_counter = FPSCounter(window=30)
     overlay = DebugOverlay(cap.width, cap.height)
 
+    # Cursor and click modules
+    cursor_ctrl: CursorController | None = None
+    click_det: ClickDetector | None = None
+
+    if not args.no_cursor:
+        cursor_ctrl = CursorController(
+            active_zone=(0.15, 0.85, 0.10, 0.80),
+            smoothing_alpha=0.35,
+            dead_zone_px=3.0,
+        )
+        click_det = ClickDetector(
+            pinch_threshold=0.045,
+            release_threshold=0.065,
+            cooldown_sec=0.25,
+            double_click_window=0.40,
+        )
+        print(f"  Screen: {cursor_ctrl.screen_w}×{cursor_ctrl.screen_h}")
+        print(f"  Cursor control: ENABLED")
+    else:
+        print(f"  Cursor control: DISABLED")
+
     show_overlay = not args.no_overlay
     calibrating = False
 
     print(f"  Scroll backend: {scroller.backend}")
     print(f"  Invert: {args.invert}")
     print(f"  Overlay: {show_overlay}")
-    print("\nReady! Show scroll gesture (index + middle fingers) to begin scrolling.")
+    print("\nReady! Gestures:")
+    print("  ☝️  Index finger only  → Cursor mode (move & click)")
+    print("  ✌️  Index + middle     → Scroll mode")
+    print("  🤏 Pinch thumb+index  → Click")
     print("Press 'q' or ESC to quit.\n")
 
     # ── Optional initial calibration ──
@@ -233,6 +361,8 @@ def main():
         run_calibration(cap, tracker, gesture_det, calibration, duration=5.0)
 
     # ── Main processing loop ──
+    prev_gesture = GESTURE_NONE
+
     try:
         while True:
             ret, frame = cap.read()
@@ -247,9 +377,10 @@ def main():
             hands = tracker.process(frame)
             current_fps = fps_counter.tick()
 
-            gesture = "NONE"
+            gesture = GESTURE_NONE
             velocity = 0.0
             finger_y = 0.0
+            click_event = ""
             hand_result: HandResult | None = None
 
             if hands:
@@ -263,24 +394,68 @@ def main():
                         calibration.record_sample(abs(y - motion._prev_y))
                     motion.update(hand_result)
 
+                elif gesture == GESTURE_CURSOR and cursor_ctrl:
+                    # ── Cursor mode ──
+                    # Reset scroll state if we just switched from scroll
+                    if prev_gesture == GESTURE_SCROLL:
+                        motion.reset()
+                        scroller.reset()
+
+                    # Move cursor
+                    idx_tip = hand_result.landmarks[HandTracker.INDEX_TIP]
+                    cursor_ctrl.update(idx_tip[0], idx_tip[1])
+
+                    # Check for click
+                    if click_det:
+                        thumb_tip = hand_result.landmarks[HandTracker.THUMB_TIP]
+                        index_tip = hand_result.landmarks[HandTracker.INDEX_TIP]
+                        click_event = click_det.update(
+                            thumb_tip, index_tip, is_cursor_mode=True
+                        )
+
                 elif gesture == GESTURE_SCROLL:
-                    # ── Active scrolling ──
+                    # ── Scroll mode (existing behavior) ──
+                    # Reset cursor state if we just switched from cursor
+                    if prev_gesture == GESTURE_CURSOR:
+                        if cursor_ctrl:
+                            cursor_ctrl.reset()
+                        if click_det:
+                            click_det.reset()
+
                     velocity = motion.update(hand_result)
                     finger_y = motion.finger_y
                     scroller.scroll(velocity)
+
                 else:
-                    # Gesture lost — reset motion state to prevent jump on re-entry
+                    # ── No active gesture — reset everything ──
                     motion.reset()
                     scroller.reset()
+                    if cursor_ctrl:
+                        cursor_ctrl.reset()
+                    if click_det:
+                        click_det.reset()
+
+                prev_gesture = gesture
+
             else:
                 # No hand — reset everything
                 motion.reset()
                 scroller.reset()
+                if cursor_ctrl:
+                    cursor_ctrl.reset()
+                if click_det:
+                    click_det.reset()
+                prev_gesture = GESTURE_NONE
 
             # ── Debug overlay ──
             if show_overlay:
-                overlay.draw(frame, current_fps, gesture, finger_y,
-                             velocity, calibrating, hand_result, calibration)
+                overlay.draw(
+                    frame, current_fps, gesture, finger_y,
+                    velocity, calibrating, hand_result, calibration,
+                    cursor_ctrl=cursor_ctrl,
+                    click_det=click_det,
+                    click_event=click_event,
+                )
 
             cv2.imshow("AutoScroll", frame)
 

@@ -151,3 +151,55 @@ class CalibrationStore:
 def lerp(a: float, b: float, t: float) -> float:
     """Linear interpolation clamped to [a, b]."""
     return a + (b - a) * max(0.0, min(1.0, t))
+
+
+def get_screen_resolution() -> tuple[int, int]:
+    """
+    Detect primary monitor resolution (width, height) in pixels.
+
+    Strategy:
+        1. ctypes (Windows) — fastest, no extra deps
+        2. screeninfo — cross-platform pip package
+        3. pyautogui — common fallback
+        4. Hardcoded 1920×1080 as last resort
+    """
+    import platform
+
+    # ── Windows: ctypes (always available) ──
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            # Enable DPI awareness so we get real resolution, not scaled
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware
+            except Exception:
+                try:
+                    user32.SetProcessDPIAware()
+                except Exception:
+                    pass
+            w = user32.GetSystemMetrics(0)
+            h = user32.GetSystemMetrics(1)
+            if w > 0 and h > 0:
+                return (w, h)
+        except Exception:
+            pass
+
+    # ── screeninfo (cross-platform) ──
+    try:
+        from screeninfo import get_monitors
+        m = get_monitors()[0]
+        return (m.width, m.height)
+    except Exception:
+        pass
+
+    # ── pyautogui fallback ──
+    try:
+        import pyautogui
+        size = pyautogui.size()
+        return (size[0], size[1])
+    except Exception:
+        pass
+
+    # ── Last resort ──
+    return (1920, 1080)
