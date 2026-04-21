@@ -1,16 +1,20 @@
-# AutoScroll — Gesture-Controlled Scrolling, Cursor & Click
+# AutoScroll — Gesture + Voice Controlled Computer Interaction
 
-A production-grade, system-level application that lets you **scroll**, **move the mouse cursor**, and **click** in **any application** (browser, IDE, PDF viewer, terminal) using real-time hand gestures captured via webcam.
+A production-grade, system-level application that lets you **scroll**, **move the mouse cursor**, **click**, and execute **voice commands** in **any application** (browser, IDE, PDF viewer, terminal) using real-time hand gestures and speech captured via webcam and microphone.
 
 ## How It Works
 
 ```
-Webcam → MediaPipe Hands → Gesture Gate → Mode Dispatch → OS Events
-                                │
-                    ┌───────────┼───────────┐
-                    ▼           ▼           ▼
-                 CURSOR      SCROLL      CLICK
-              (move mouse)  (scroll Δy)  (pinch→click)
+Webcam → MediaPipe Hands → Gesture Gate → Mode Dispatch ─┐
+                                │                        │
+                    ┌───────────┼───────────┐             ├→ OS Events
+                    ▼           ▼           ▼             │
+                 CURSOR      SCROLL      CLICK            │
+              (move mouse)  (scroll Δy)  (pinch→click)    │
+                                                          │
+Microphone → Vosk STT → Intent Parser → Fusion Engine ───┘
+                              │                ▲
+                              └─→ Gemma LLM ───┘ (opt-in)
 ```
 
 1. **Hand Tracking**: MediaPipe extracts 21 hand landmarks at 30+ FPS
@@ -53,8 +57,14 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-# Basic run (scroll + cursor + click)
+# Basic run — gestures only (scroll + cursor + click)
 python main.py
+
+# Enable voice commands (requires microphone)
+python main.py --voice
+
+# Voice + Gemma LLM intent (GPU recommended)
+python main.py --voice --use-llm
 
 # With calibration phase (recommended for first use)
 python main.py --calibrate
@@ -76,6 +86,9 @@ python main.py --no-overlay
 
 # Adjust sensitivity
 python main.py --sensitivity 1.5
+
+# Voice with custom settings
+python main.py --voice --voice-window 2.0 --voice-cooldown 0.5
 ```
 
 ### Keyboard Controls (while running)
@@ -85,8 +98,34 @@ python main.py --sensitivity 1.5
 | `q` / `ESC` | Quit |
 | `c` | Toggle calibration mode |
 | `d` | Toggle debug overlay |
+| `v` | Toggle voice mode on/off |
 | `+` / `=` | Increase sensitivity |
 | `-` | Decrease sensitivity |
+
+## Voice Commands
+
+Enable with `--voice` flag. Speak naturally while using hand gestures:
+
+| Voice Command | Action | Requires |
+|---------------|--------|----------|
+| "click here" / "click" | Click at cursor position | Hand detected |
+| "double click" | Double click at cursor | Hand detected |
+| "open this" / "open that" | Click to open pointed element | Stable cursor |
+| "scroll faster" | Double scroll speed (stacks up to 8×) | Scroll mode |
+| "scroll slower" | Halve scroll speed (down to 0.25×) | Scroll mode |
+| "scroll up" / "scroll down" | Force scroll in direction | Any mode |
+| "stop scrolling" / "stop" | Stop scrolling, reset speed | Any mode |
+| "drag this" / "drag" | Hold mouse button (start drag) | Stable cursor |
+| "drop" / "release" / "let go" | Release mouse button (end drag) | Drag active |
+
+### Voice + Gesture Fusion
+
+Voice commands are **fused** with gesture state for precision:
+- Saying "click here" while pointing → clicks at the cursor position
+- Saying "scroll faster" while scrolling → increases scroll sensitivity
+- Saying "stop" while dragging → ends the drag operation
+- Voice commands expire after 1.5 seconds if no matching gesture is active
+- Gesture-only mode always works — voice only enhances, never blocks
 
 ## Cursor Control
 
@@ -128,7 +167,13 @@ main.py                    — Entry point, orchestrator, debug overlay
 ├── scroll_controller.py   — OS-level scroll dispatch (pynput/pyautogui)
 ├── cursor_controller.py   — Camera→screen coordinate mapping + cursor movement
 ├── click_detector.py      — Pinch detection FSM + click dispatch
-└── utils.py               — Filters (EMA, 1€), FPS counter, calibration, screen utils
+├── utils.py               — Filters (EMA, 1€), FPS counter, calibration, screen utils
+│
+├── voice_input.py         — Microphone audio capture (sounddevice, threaded)
+├── speech_to_text.py      — Streaming offline STT (Vosk)
+├── intent_parser.py       — Fast regex-based command parser (Tier 1)
+├── llm_intent.py          — Gemma LLM intent classifier (Tier 2, opt-in)
+└── fusion_engine.py       — Voice+gesture fusion decision engine
 ```
 
 ## Key Algorithms
@@ -185,6 +230,29 @@ Run `python main.py --calibrate` or press `c` during runtime. Move your hand slo
 
 - Target: **≥25 FPS** on 640×480 input
 - End-to-end latency: **<50 ms** (MediaPipe lite model + threaded capture)
+- Voice latency (Tier 1): **<150 ms** speech-to-action (regex parser)
+- Voice latency (Tier 2): **200–800 ms** with Gemma LLM (async, non-blocking)
 - Cursor movement adds ~0.1ms overhead per frame
 - Click detection is pure math on existing landmarks — zero extra cost
 - Frame acquisition is non-blocking (dedicated reader thread)
+- Voice pipeline runs in 3 separate daemon threads (audio, STT, LLM)
+
+## Voice Setup
+
+### Microphone
+The system uses your default microphone. On first run with `--voice`, the Vosk speech model (~40 MB) is automatically downloaded.
+
+### Custom Vosk Model
+For better accuracy, download a larger model from [alphacephei.com/vosk/models](https://alphacephei.com/vosk/models) and set:
+```bash
+set VOSK_MODEL_PATH=C:\path\to\vosk-model-en-us-0.22
+python main.py --voice
+```
+
+### Gemma LLM (Optional)
+For advanced intent understanding:
+```bash
+pip install llama-cpp-python
+# Download a Gemma GGUF model and place in ~/.cache/autoscroll/models/
+python main.py --voice --use-llm --llm-model-path path/to/gemma-2b-it-q4_k_m.gguf
+```

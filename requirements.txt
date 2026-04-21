@@ -1,4 +1,4 @@
-# AutoScroll — Gesture-Controlled Scrolling + Cursor + Click
+# AutoScroll — Gesture-Controlled Scrolling + Cursor + Click + Voice
 # Core dependencies
 
 opencv-python>=4.8.0
@@ -6,8 +6,19 @@ mediapipe>=0.10.9
 pynput>=1.7.6
 numpy>=1.24.0
 
+# Voice / multimodal interaction
+vosk>=0.3.45
+sounddevice>=0.4.6
+
 # Cross-platform screen resolution detection (fallback for non-Windows)
 # screeninfo>=0.8.1
 
 # Optional fallback for scroll/cursor control
 # pyautogui>=0.9.54
+
+# Optional: LLM-based intent parsing (GPU recommended)
+# Uncomment and install for --use-llm mode:
+# llama-cpp-python>=0.2.0
+
+# Optional: audio feedback
+# pyttsx3>=2.90
