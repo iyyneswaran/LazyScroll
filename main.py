@@ -1,8 +1,10 @@
 """
-main.py — Entry point for gesture-controlled scrolling + cursor + click.
+main.py — Entry point for gesture-controlled scrolling + cursor + click + voice.
 
 Usage:
-    python main.py                  # Run with defaults
+    python main.py                  # Run with defaults (gesture only)
+    python main.py --voice          # Enable voice commands
+    python main.py --use-llm        # Enable Gemma LLM intent (requires GGUF model)
     python main.py --calibrate      # Run calibration phase first
     python main.py --invert         # Use natural (inverted) scrolling
     python main.py --camera 1       # Use camera index 1
@@ -13,6 +15,7 @@ Controls (keyboard):
     q / ESC     Quit
     c           Toggle calibration mode
     d           Toggle debug overlay
+    v           Toggle voice mode on/off
     +/-         Adjust sensitivity in real-time
 
 Gesture Modes:
@@ -20,11 +23,22 @@ Gesture Modes:
     ✌️  Index + middle       → Scroll mode (existing behavior)
     🤏  Pinch (thumb+index)  → Click (single / double)
     ✋  Open palm / fist     → Idle
+
+Voice Commands (when --voice enabled):
+    "click here"      → Click at cursor
+    "double click"    → Double click at cursor
+    "open this"       → Click at cursor (= open)
+    "scroll faster"   → Increase scroll speed
+    "scroll slower"   → Decrease scroll speed
+    "stop scrolling"  → Stop scrolling
+    "drag this"       → Initiate drag
+    "drop" / "release"→ End drag
 """
 
 import argparse
 import sys
 import time
+import logging
 import cv2
 import numpy as np
 
@@ -39,6 +53,15 @@ from scroll_controller import ScrollController
 from cursor_controller import CursorController
 from click_detector import ClickDetector
 from utils import FPSCounter, CalibrationStore
+
+# Voice / multimodal imports (lazy-loaded in main())
+# from voice_input import VoiceInput
+# from speech_to_text import SpeechToText
+# from intent_parser import IntentParser
+# from llm_intent import LLMIntent
+# from fusion_engine import FusionEngine, GestureState, FusedAction, ActionType
+
+logger = logging.getLogger(__name__)
 
 
 # ────────────────────────── Debug overlay ──────────────────────────
@@ -57,6 +80,9 @@ class DebugOverlay:
     CURSOR_COLOR = (255, 200, 50)   # cyan-yellow for cursor mode
     CLICK_COLOR = (0, 0, 255)       # red for click event
     PINCH_READY = (0, 255, 255)     # yellow for pinch-ready
+    VOICE_COLOR = (255, 100, 255)   # magenta for voice
+    VOICE_ACTIVE_COLOR = (0, 255, 180)  # teal for listening
+    FUSED_COLOR = (100, 255, 100)   # bright green for fused action
 
     # Gesture → display color
     MODE_COLORS = {
@@ -71,13 +97,21 @@ class DebugOverlay:
     def __init__(self, frame_w: int, frame_h: int):
         self.fw = frame_w
         self.fh = frame_h
+        self._action_flash_time: float = 0.0
+        self._action_flash_text: str = ""
+
+    def trigger_action_flash(self, text: str):
+        """Trigger a visual flash for a fused action."""
+        self._action_flash_time = time.perf_counter()
+        self._action_flash_text = text
 
     def draw(self, frame: np.ndarray, fps: float, gesture: str,
              finger_y: float, velocity: float, calibrating: bool,
              hand: HandResult | None, calibration: CalibrationStore,
              cursor_ctrl: CursorController | None = None,
              click_det: ClickDetector | None = None,
-             click_event: str = ""):
+             click_event: str = "",
+             fusion_engine=None):
         """Overlay all debug info onto frame (mutates in place)."""
         h, w = frame.shape[:2]
         mode_color = self.MODE_COLORS.get(gesture, self.INACTIVE)
@@ -124,6 +158,14 @@ class DebugOverlay:
             cv2.line(frame, (bar_cx, y0 - 2), (bar_cx, y0 + 12), self.TEXT, 1)
             y0 += 18
 
+            # Scroll multiplier (from voice)
+            if fusion_engine and fusion_engine.scroll_multiplier != 1.0:
+                y0 += dy
+                cv2.putText(frame,
+                            f"Scroll x{fusion_engine.scroll_multiplier:.1f}",
+                            (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+                            self.VOICE_COLOR, 2)
+
         elif gesture == GESTURE_CURSOR and cursor_ctrl:
             # ── Cursor-specific info ──
             y0 += dy
@@ -158,6 +200,12 @@ class DebugOverlay:
                     cv2.putText(frame, f">> {click_event} <<", (10, y0),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, self.CLICK_COLOR, 2)
 
+            # Drag indicator
+            if fusion_engine and fusion_engine.drag_active:
+                y0 += dy
+                cv2.putText(frame, "** DRAGGING **", (10, y0),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.VOICE_COLOR, 2)
+
         # Sensitivity / calibration
         y0 += dy
         sens_text = f"Sens: {calibration.sensitivity:.2f}  DZ: {calibration.dead_zone:.4f}"
@@ -183,6 +231,10 @@ class DebugOverlay:
                     color = self.PINCH_READY
                 if click_event:
                     color = self.CLICK_COLOR
+
+                # Drag mode: change crosshair to magenta
+                if fusion_engine and fusion_engine.drag_active:
+                    color = self.VOICE_COLOR
 
                 # Crosshair
                 cv2.line(frame, (cx - 20, cy), (cx + 20, cy), color, 2)
@@ -213,6 +265,27 @@ class DebugOverlay:
                 cv2.circle(frame, (cx, cy), 10, self.INACTIVE, 1)
                 cv2.circle(frame, (cx, cy), 3, self.INACTIVE, -1)
 
+        # ── Voice panel (right side) ──
+        if fusion_engine is not None:
+            self._draw_voice_panel(frame, fusion_engine, w, h)
+
+        # ── Action flash effect ──
+        flash_age = time.perf_counter() - self._action_flash_time
+        if flash_age < 0.8 and self._action_flash_text:
+            alpha = max(0.0, 1.0 - flash_age / 0.8)
+            flash_color = (
+                int(self.FUSED_COLOR[0] * alpha),
+                int(self.FUSED_COLOR[1] * alpha),
+                int(self.FUSED_COLOR[2] * alpha),
+            )
+            text_size = cv2.getTextSize(
+                self._action_flash_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2
+            )[0]
+            tx = (w - text_size[0]) // 2
+            ty = h // 2
+            cv2.putText(frame, self._action_flash_text, (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, flash_color, 2)
+
         # --- Status bar at bottom ---
         cv2.rectangle(frame, (0, h - 34), (w, h), self.BG, -1)
 
@@ -220,8 +293,12 @@ class DebugOverlay:
             status = "CURSOR ACTIVE"
             if click_event:
                 status = f"CURSOR — {click_event}!"
+            if fusion_engine and fusion_engine.drag_active:
+                status = "CURSOR — DRAGGING"
         elif gesture == GESTURE_SCROLL:
             status = "SCROLL ACTIVE"
+            if fusion_engine and fusion_engine.scroll_multiplier != 1.0:
+                status += f" (x{fusion_engine.scroll_multiplier:.1f})"
         else:
             status = "Waiting for gesture (index=cursor, index+middle=scroll)"
 
@@ -229,9 +306,78 @@ class DebugOverlay:
         cv2.putText(frame, status, (10, h - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.50, st_color, 1)
 
-        keys_text = "[q] Quit  [c] Calibrate  [d] Overlay  [+/-] Sensitivity"
-        cv2.putText(frame, keys_text, (w - 430, h - 10),
+        mode_text = fusion_engine.mode_label if fusion_engine else "GESTURE ONLY"
+        keys_text = f"[q]Quit [c]Cal [d]Overlay [v]Voice  |  {mode_text}"
+        cv2.putText(frame, keys_text, (w - 480, h - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 140, 140), 1)
+
+    def _draw_voice_panel(self, frame: np.ndarray, fusion, w: int, h: int):
+        """Draw the voice / multimodal status panel on the right side."""
+        panel_w = 260
+        panel_h = 160
+        px = w - panel_w - 5
+        py = 5
+
+        # Semi-transparent background
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (px, py), (px + panel_w, py + panel_h), self.BG, -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+        # Header
+        voice_on = fusion.voice_active
+        header_color = self.VOICE_ACTIVE_COLOR if voice_on else self.INACTIVE
+        header_text = "🎤 LISTENING" if voice_on else "🎤 OFF"
+        cv2.putText(frame, header_text, (px + 8, py + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, header_color, 2)
+
+        # Listening indicator dot (pulsing)
+        if voice_on:
+            pulse = abs((time.perf_counter() * 3) % 2.0 - 1.0)
+            radius = int(6 + pulse * 4)
+            cv2.circle(frame, (px + panel_w - 20, py + 18), radius,
+                       self.VOICE_ACTIVE_COLOR, -1)
+
+        # Last command
+        y = py + 48
+        cmd = fusion.last_command_text or "—"
+        if len(cmd) > 28:
+            cmd = cmd[:25] + "..."
+        cv2.putText(frame, f"Cmd: {cmd}", (px + 8, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, self.TEXT, 1)
+
+        # Intent
+        y += 24
+        intent_text = fusion.last_intent_name or "—"
+        conf = fusion.last_confidence
+        conf_color = self.ACTIVE if conf > 0.7 else self.ACCENT if conf > 0.4 else self.INACTIVE
+        cv2.putText(frame, f"Intent: {intent_text}", (px + 8, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, conf_color, 1)
+
+        # Confidence bar
+        y += 4
+        bar_w = int(conf * (panel_w - 20))
+        cv2.rectangle(frame, (px + 8, y), (px + 8 + bar_w, y + 5),
+                      conf_color, -1)
+        cv2.rectangle(frame, (px + 8, y), (px + panel_w - 12, y + 5),
+                      self.TEXT, 1)
+
+        # Last action
+        y += 22
+        action_text = fusion.last_action or "—"
+        cv2.putText(frame, f"Action: {action_text}", (px + 8, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, self.FUSED_COLOR, 1)
+
+        # Voice latency
+        y += 24
+        lat = fusion.voice_latency_ms
+        lat_color = self.ACTIVE if lat < 150 else self.ACCENT if lat < 300 else self.CLICK_COLOR
+        cv2.putText(frame, f"Latency: {lat:.0f} ms", (px + 8, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, lat_color, 1)
+
+        # Border
+        border_color = self.VOICE_ACTIVE_COLOR if voice_on else self.INACTIVE
+        cv2.rectangle(frame, (px, py), (px + panel_w, py + panel_h),
+                      border_color, 1)
 
 
 # ────────────────────────── Calibration phase ──────────────────────────
@@ -290,11 +436,99 @@ def run_calibration(cap: VideoCapture, tracker: HandTracker,
     print(f"\nCalibration complete! Parameters: {calibration.to_dict()}\n")
 
 
+# ────────────────────────── Voice action executor ──────────────────────────
+
+class VoiceActionExecutor:
+    """
+    Executes fused actions from the voice+gesture fusion engine.
+    Translates FusedAction objects into system-level input events.
+    """
+
+    def __init__(self, scroller: ScrollController, calibration: CalibrationStore):
+        self._scroller = scroller
+        self._calibration = calibration
+        self._dragging = False
+
+        try:
+            from pynput.mouse import Controller as MouseController, Button
+            self._mouse = MouseController()
+            self._button = Button.left
+        except ImportError:
+            self._mouse = None
+            self._button = None
+
+    def execute(self, action) -> str:
+        """
+        Execute a FusedAction and return a description string.
+        """
+        from fusion_engine import ActionType
+
+        if action.action == ActionType.CLICK:
+            return self._click()
+        elif action.action == ActionType.DOUBLE_CLICK:
+            return self._double_click()
+        elif action.action == ActionType.OPEN:
+            return self._click()  # open = click
+        elif action.action == ActionType.SCROLL_ADJUST:
+            return self._scroll_adjust(action.scroll_multiplier)
+        elif action.action == ActionType.SCROLL_DIRECTION:
+            return self._scroll_direction(action.scroll_direction)
+        elif action.action == ActionType.STOP_SCROLL:
+            return self._stop_scroll()
+        elif action.action == ActionType.DRAG_START:
+            return self._drag_start()
+        elif action.action == ActionType.DRAG_END:
+            return self._drag_end()
+        return ""
+
+    def _click(self) -> str:
+        if self._mouse:
+            self._mouse.click(self._button, 1)
+        return "VOICE CLICK"
+
+    def _double_click(self) -> str:
+        if self._mouse:
+            self._mouse.click(self._button, 2)
+        return "VOICE DOUBLE CLICK"
+
+    def _scroll_adjust(self, multiplier: float) -> str:
+        self._calibration.sensitivity = self._calibration.sensitivity  # maintain base
+        return f"SCROLL x{multiplier:.1f}"
+
+    def _scroll_direction(self, direction: float) -> str:
+        # Inject a scroll event in the requested direction
+        velocity = direction * 3.0  # moderate speed
+        self._scroller.scroll(velocity)
+        return f"SCROLL {'DOWN' if direction > 0 else 'UP'}"
+
+    def _stop_scroll(self) -> str:
+        self._scroller.reset()
+        return "SCROLL STOPPED"
+
+    def _drag_start(self) -> str:
+        if self._mouse and not self._dragging:
+            self._mouse.press(self._button)
+            self._dragging = True
+        return "DRAG START"
+
+    def _drag_end(self) -> str:
+        if self._mouse and self._dragging:
+            self._mouse.release(self._button)
+            self._dragging = False
+        return "DRAG END"
+
+    def cleanup(self):
+        """Release any held buttons."""
+        if self._dragging and self._mouse:
+            self._mouse.release(self._button)
+            self._dragging = False
+
+
 # ────────────────────────── Main loop ──────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Gesture-controlled OS-level scrolling + cursor + click via webcam"
+        description="Gesture-controlled OS-level scrolling + cursor + click + voice via webcam"
     )
     parser.add_argument("--camera", type=int, default=0, help="Camera index")
     parser.add_argument("--width", type=int, default=640, help="Capture width")
@@ -304,9 +538,27 @@ def main():
     parser.add_argument("--no-overlay", action="store_true", help="Disable debug overlay")
     parser.add_argument("--no-cursor", action="store_true", help="Disable cursor control")
     parser.add_argument("--sensitivity", type=float, default=1.0, help="Scroll sensitivity multiplier")
+
+    # Voice / multimodal arguments
+    parser.add_argument("--voice", action="store_true", help="Enable voice commands")
+    parser.add_argument("--use-llm", action="store_true",
+                        help="Enable Gemma LLM for intent parsing (requires GGUF model)")
+    parser.add_argument("--llm-model-path", type=str, default=None,
+                        help="Path to Gemma GGUF model file")
+    parser.add_argument("--voice-window", type=float, default=1.5,
+                        help="Voice intent validity window in seconds (default: 1.5)")
+    parser.add_argument("--voice-cooldown", type=float, default=1.0,
+                        help="Minimum seconds between same voice commands (default: 1.0)")
     args = parser.parse_args()
 
-    # ── Initialise components ──
+    # ── Configure logging ──
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    # ── Initialise core components ──
     print("Starting AutoScroll...")
     print(f"  Camera: {args.camera}  Resolution: {args.width}×{args.height}")
 
@@ -344,17 +596,108 @@ def main():
     else:
         print(f"  Cursor control: DISABLED")
 
+    # ── Initialise voice / multimodal components ──
+    voice_input = None
+    stt = None
+    intent_parser = None
+    llm_intent = None
+    fusion_engine = None
+    voice_executor = None
+    voice_enabled = args.voice
+
+    if voice_enabled:
+        print("\n  Initialising voice pipeline...")
+        try:
+            from voice_input import VoiceInput
+            from speech_to_text import SpeechToText
+            from intent_parser import IntentParser
+            from fusion_engine import FusionEngine
+
+            # Audio capture
+            voice_input = VoiceInput(sample_rate=16000, block_duration_ms=100)
+            mic_ok = voice_input.start()
+            if mic_ok:
+                print(f"  Microphone: ACTIVE")
+            else:
+                print(f"  Microphone: FAILED (voice disabled)")
+                voice_enabled = False
+
+            if voice_enabled:
+                # Speech-to-text
+                stt = SpeechToText(voice_input=voice_input, sample_rate=16000)
+                stt_ok = stt.start()
+                if stt_ok:
+                    print(f"  Speech-to-text: ACTIVE (Vosk)")
+                else:
+                    print(f"  Speech-to-text: FAILED (voice disabled)")
+                    voice_enabled = False
+
+            if voice_enabled:
+                # Intent parser (always available)
+                intent_parser = IntentParser(
+                    min_confidence=0.5,
+                    cooldown_sec=args.voice_cooldown,
+                )
+
+                # Optional LLM
+                if args.use_llm:
+                    try:
+                        from llm_intent import LLMIntent
+                        llm_intent = LLMIntent(model_path=args.llm_model_path)
+                        llm_ok = llm_intent.start()
+                        if llm_ok:
+                            print(f"  LLM intent: ACTIVE (Gemma)")
+                        else:
+                            print(f"  LLM intent: UNAVAILABLE (using regex only)")
+                            llm_intent = None
+                    except Exception as e:
+                        print(f"  LLM intent: ERROR ({e})")
+                        llm_intent = None
+
+                # Fusion engine
+                fusion_engine = FusionEngine(
+                    intent_parser=intent_parser,
+                    stt=stt,
+                    llm_intent=llm_intent,
+                    voice_window_sec=args.voice_window,
+                )
+
+                # Voice action executor
+                voice_executor = VoiceActionExecutor(scroller, calibration)
+
+                print(f"  Voice pipeline: READY")
+                print(f"  Voice window: {args.voice_window}s")
+
+        except ImportError as e:
+            print(f"  Voice dependencies missing: {e}")
+            print(f"  Install with: pip install vosk sounddevice")
+            voice_enabled = False
+        except Exception as e:
+            print(f"  Voice init error: {e}")
+            voice_enabled = False
+
     show_overlay = not args.no_overlay
     calibrating = False
 
-    print(f"  Scroll backend: {scroller.backend}")
+    print(f"\n  Scroll backend: {scroller.backend}")
     print(f"  Invert: {args.invert}")
     print(f"  Overlay: {show_overlay}")
+    print(f"  Voice: {'ENABLED' if voice_enabled else 'DISABLED'}")
     print("\nReady! Gestures:")
     print("  ☝️  Index finger only  → Cursor mode (move & click)")
     print("  ✌️  Index + middle     → Scroll mode")
     print("  🤏 Pinch thumb+index  → Click")
-    print("Press 'q' or ESC to quit.\n")
+    if voice_enabled:
+        print("\nVoice commands:")
+        print("  'click here'       → Click at cursor")
+        print("  'double click'     → Double click")
+        print("  'open this'        → Open (click) at cursor")
+        print("  'scroll faster'    → Increase scroll speed")
+        print("  'scroll slower'    → Decrease scroll speed")
+        print("  'stop scrolling'   → Stop scroll")
+        print("  'drag this'        → Start drag")
+        print("  'drop' / 'release' → End drag")
+    print("\nPress 'q' or ESC to quit, 'v' to toggle voice.\n")
 
     # ── Optional initial calibration ──
     if args.calibrate:
@@ -424,7 +767,13 @@ def main():
 
                     velocity = motion.update(hand_result)
                     finger_y = motion.finger_y
-                    scroller.scroll(velocity)
+
+                    # Apply voice scroll multiplier
+                    effective_velocity = velocity
+                    if fusion_engine:
+                        effective_velocity = velocity * fusion_engine.scroll_multiplier
+
+                    scroller.scroll(effective_velocity)
 
                 else:
                     # ── No active gesture — reset everything ──
@@ -447,6 +796,36 @@ def main():
                     click_det.reset()
                 prev_gesture = GESTURE_NONE
 
+            # ── Voice + gesture fusion ──
+            if fusion_engine and voice_enabled:
+                from fusion_engine import GestureState, ActionType
+
+                # Build gesture state snapshot
+                g_state = GestureState(
+                    gesture=gesture,
+                    cursor_x=cursor_ctrl.screen_x if cursor_ctrl else 0.0,
+                    cursor_y=cursor_ctrl.screen_y if cursor_ctrl else 0.0,
+                    cursor_stable=False,  # fusion engine tracks its own stability
+                    pinch_detected=(click_det.pinch_distance < 0.06) if click_det else False,
+                    pinch_distance=click_det.pinch_distance if click_det else 1.0,
+                    scroll_velocity=velocity,
+                    hand_detected=hand_result is not None,
+                    timestamp=time.perf_counter(),
+                )
+
+                # Process fusion
+                fused_action = fusion_engine.process(g_state)
+
+                # Execute fused action
+                if fused_action and fused_action.is_valid and voice_executor:
+                    action_desc = voice_executor.execute(fused_action)
+                    if action_desc:
+                        print(f"  🎤 Voice action: {action_desc} "
+                              f"(intent={fused_action.voice_intent}, "
+                              f"conf={fused_action.confidence:.2f})")
+                        if show_overlay:
+                            overlay.trigger_action_flash(action_desc)
+
             # ── Debug overlay ──
             if show_overlay:
                 overlay.draw(
@@ -455,6 +834,7 @@ def main():
                     cursor_ctrl=cursor_ctrl,
                     click_det=click_det,
                     click_event=click_event,
+                    fusion_engine=fusion_engine if voice_enabled else None,
                 )
 
             cv2.imshow("AutoScroll", frame)
@@ -465,6 +845,17 @@ def main():
                 break
             elif key == ord('d'):
                 show_overlay = not show_overlay
+            elif key == ord('v'):
+                # Toggle voice mode
+                if voice_input is not None and stt is not None:
+                    if voice_enabled:
+                        voice_enabled = False
+                        print("  Voice: DISABLED")
+                    else:
+                        voice_enabled = True
+                        print("  Voice: ENABLED")
+                else:
+                    print("  Voice: not available (start with --voice)")
             elif key == ord('c'):
                 if not calibrating:
                     calibrating = True
@@ -485,6 +876,16 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
+        # Cleanup voice pipeline
+        if voice_executor:
+            voice_executor.cleanup()
+        if llm_intent:
+            llm_intent.stop()
+        if stt:
+            stt.stop()
+        if voice_input:
+            voice_input.stop()
+
         cap.stop()
         tracker.close()
         cv2.destroyAllWindows()
